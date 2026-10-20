@@ -1,0 +1,4 @@
+.git
+unifi-blocklist-chunker
+*.md
+compose.yaml

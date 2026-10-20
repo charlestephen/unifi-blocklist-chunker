@@ -1,0 +1,17 @@
+services:
+  blocklist-chunker:
+    build: .
+    image: unifi-blocklist-chunker:latest
+    restart: unless-stopped
+    environment:
+      # Comma-separated source list URLs (txt, json, yaml, toml).
+      BLOCKLIST_URLS: "https://example.com/dns-blocklist.txt,https://example.com/ip-blocklist.txt"
+      # Max entries per output chunk. UniFi controllers commonly cap at 100000.
+      CHUNK_SIZE: "100000"
+      # How often sources are re-fetched (Go duration; 0 disables).
+      REFRESH_INTERVAL: "6h"
+      # Public base URL for generated chunk links. Leave unset to derive it
+      # from reverse-proxy headers (X-Forwarded-Proto / -Host / -Prefix).
+      # BASE_URL: "https://lists.example.com"
+    ports:
+      - "8080:8080"
