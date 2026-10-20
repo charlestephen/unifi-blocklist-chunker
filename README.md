@@ -86,10 +86,9 @@ Then open `http://<host>:8080/` for the chunk URLs to paste into UniFi, or
 publish semver tags (e.g. `1.2.3`, `1.2`), and every build also publishes a
 `sha-<short>` tag.
 
-With Compose: edit the environment in `compose.yaml`, then
-`podman compose up -d` (or `docker compose up -d`). To run a published image
-instead of building locally, replace `build: .` with
-`image: ghcr.io/charlestephen/unifi-blocklist-chunker:latest`.
+With Compose: edit the environment in `compose.yaml` (it already references
+the GHCR image; a Docker Hub alternative is noted inside), then
+`podman compose up -d` (or `docker compose up -d`).
 
 Build from source instead: `podman build -t unifi-blocklist-chunker .`
-(or `docker build -t unifi-blocklist-chunker .`).
+(or `docker build -f Containerfile -t unifi-blocklist-chunker .`).

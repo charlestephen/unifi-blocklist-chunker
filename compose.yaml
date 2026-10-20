@@ -1,7 +1,12 @@
 services:
   blocklist-chunker:
-    build: .
-    image: unifi-blocklist-chunker:latest
+    # Published image. Docker Hub equivalent:
+    #   docker.io/charlestephen/unifi-blocklist-chunker:latest
+    image: ghcr.io/charlestephen/unifi-blocklist-chunker:latest
+    # To build from source instead, drop `image:` and use:
+    #   build:
+    #     context: .
+    #     dockerfile: Containerfile
     restart: unless-stopped
     environment:
       # Comma-separated source list URLs (txt, json, yaml, toml).
