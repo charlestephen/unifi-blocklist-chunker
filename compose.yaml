@@ -15,6 +15,8 @@ services:
       CHUNK_SIZE: "100000"
       # How often sources are re-fetched (Go duration; 0 disables).
       REFRESH_INTERVAL: "6h"
+      # Listen port inside the container; keep in sync with `ports:` below.
+      # PORT: "8080"
       # Public base URL for generated chunk links. Leave unset to derive it
       # from reverse-proxy headers (X-Forwarded-Proto / -Host / -Prefix).
       # BASE_URL: "https://lists.example.com"

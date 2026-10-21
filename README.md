@@ -57,6 +57,30 @@ the `/manage` page uses in a browser). When `ADMIN_TOKEN` is unset, the admin
 endpoints return `503` rather than operating unauthenticated. `/search`, the
 chunk URLs, and `/stats` remain public.
 
+Examples (`<host>` is the service origin, `<token>` is `ADMIN_TOKEN`):
+
+```sh
+# Is an entry served, and in which chunk?
+curl 'http://<host>:8080/search?q=example.com'
+curl 'http://<host>:8080/search?q=1.2.3.4'
+
+# Remove an entry (exact match; takes effect immediately)
+curl -X POST -H 'Authorization: Bearer <token>' \
+  -d '{"entry":"example.com"}' http://<host>:8080/exclusions
+
+# List recorded exclusions
+curl -H 'Authorization: Bearer <token>' http://<host>:8080/exclusions
+
+# Restore an entry (CIDRs keep their / in the path form)
+curl -X DELETE -H 'Authorization: Bearer <token>' \
+  http://<host>:8080/exclusions/example.com
+curl -X DELETE -H 'Authorization: Bearer <token>' \
+  -d '{"entry":"1.2.0.0/16"}' http://<host>:8080/exclusions
+```
+
+Or open `http://<host>:8080/manage` in a browser (any username, password is
+`ADMIN_TOKEN`) for the same operations interactively.
+
 Chunk URLs carry no secrets and are safe to paste into UniFi's external
 blocklist fields; one URL per chunk is needed, and the number of URLs changes
 as upstream lists grow or shrink.
@@ -93,8 +117,11 @@ Podman:
 podman run -d --name unifi-blocklist-chunker \
   --restart=unless-stopped \
   -p 8080:8080 \
+  -v unifi-blocklist-chunker-data:/data \
   -e BLOCKLIST_URLS="https://example.com/list1.txt,https://example.com/list2.json" \
   -e CHUNK_SIZE=100000 \
+  -e ADMIN_TOKEN="example-admin-token" \
+  -e EXCLUSIONS_FILE="/data/exclusions.json" \
   ghcr.io/charlestephen/unifi-blocklist-chunker:latest
 ```
 
@@ -104,19 +131,36 @@ Docker (identical, from Docker Hub):
 docker run -d --name unifi-blocklist-chunker \
   --restart unless-stopped \
   -p 8080:8080 \
+  -v unifi-blocklist-chunker-data:/data \
   -e BLOCKLIST_URLS="https://example.com/list1.txt,https://example.com/list2.json" \
   -e CHUNK_SIZE=100000 \
+  -e ADMIN_TOKEN="example-admin-token" \
+  -e EXCLUSIONS_FILE="/data/exclusions.json" \
   docker.io/charlestephen/unifi-blocklist-chunker:latest
 ```
 
-Then open `http://<host>:8080/` for the chunk URLs to paste into UniFi, or
-`http://<host>:8080/stats` for counts. Tags: `latest` tracks `main`; releases
+The `/data` volume is what makes exclusions survive container recreation;
+without it (or without `EXCLUSIONS_FILE` pointed at mounted storage) they
+last only for the life of the container filesystem. `ADMIN_TOKEN` can be
+omitted, in which case the admin endpoints are disabled and only the public
+chunk/search/stats endpoints work.
+
+Then open `http://<host>:8080/` for the chunk URLs to paste into UniFi,
+`http://<host>:8080/stats` for counts, or `http://<host>:8080/manage` to
+search and remove entries. Tags: `latest` tracks `main`; releases
 publish semver tags (e.g. `1.2.3`, `1.2`), and every build also publishes a
 `sha-<short>` tag.
 
-With Compose: edit the environment in `compose.yaml` (it already references
-the GHCR image; a Docker Hub alternative is noted inside), then
-`podman compose up -d` (or `docker compose up -d`).
+With Compose: `compose.yaml` already wires every variable above — source
+URLs, sizes, and intervals are set inline, the exclusions file lives on the
+`blocklist-data` volume — except `ADMIN_TOKEN`, which it interpolates from
+the caller's environment (`${ADMIN_TOKEN:-}`, empty disables the admin
+endpoints):
+
+```sh
+ADMIN_TOKEN='example-admin-token' podman compose up -d
+# (or: ADMIN_TOKEN='example-admin-token' docker compose up -d)
+```
 
 Build from source instead: `podman build -t unifi-blocklist-chunker .`
 (or `docker build -f Containerfile -t unifi-blocklist-chunker .`).
