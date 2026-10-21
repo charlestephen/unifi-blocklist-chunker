@@ -18,5 +18,14 @@ services:
       # Public base URL for generated chunk links. Leave unset to derive it
       # from reverse-proxy headers (X-Forwarded-Proto / -Host / -Prefix).
       # BASE_URL: "https://lists.example.com"
+      # Gates /manage and the exclusion endpoints. Unset disables them.
+      ADMIN_TOKEN: "${ADMIN_TOKEN:-}"
+      # Persisted exclusions, on the volume below so they survive restarts.
+      EXCLUSIONS_FILE: "/data/exclusions.json"
+    volumes:
+      - blocklist-data:/data
     ports:
       - "8080:8080"
+
+volumes:
+  blocklist-data:

@@ -17,21 +17,25 @@ import (
 )
 
 type config struct {
-	port       string
-	chunkSize  int
-	sources    []string
-	refresh    time.Duration
-	baseURL    string
-	fetchLimit int64
+	port           string
+	chunkSize      int
+	sources        []string
+	refresh        time.Duration
+	baseURL        string
+	fetchLimit     int64
+	adminToken     string
+	exclusionsFile string
 }
 
 func loadConfig() (config, error) {
 	cfg := config{
-		port:       envOr("PORT", "8080"),
-		chunkSize:  100000,
-		refresh:    6 * time.Hour,
-		baseURL:    strings.TrimSuffix(os.Getenv("BASE_URL"), "/"),
-		fetchLimit: 128 << 20,
+		port:           envOr("PORT", "8080"),
+		chunkSize:      100000,
+		refresh:        6 * time.Hour,
+		baseURL:        strings.TrimSuffix(os.Getenv("BASE_URL"), "/"),
+		fetchLimit:     128 << 20,
+		adminToken:     os.Getenv("ADMIN_TOKEN"),
+		exclusionsFile: envOr("EXCLUSIONS_FILE", "exclusions.json"),
 	}
 	if v := os.Getenv("CHUNK_SIZE"); v != "" {
 		n, err := strconv.Atoi(v)
@@ -68,19 +72,67 @@ func envOr(key, def string) string {
 }
 
 type snapshot struct {
+	// dnsAll/ipAll are the full sorted upstream entries; dnsServed/ipServed
+	// are the same minus persistent exclusions. The chunks serve the
+	// latter, so an exclusion can be applied or undone by re-chunking
+	// without a refetch.
+	dnsAll    []string
+	ipAll     []string
+	dnsServed []string
+	ipServed  []string
 	dnsChunks [][]string
 	ipChunks  [][]string
 	dnsCount  int
 	ipCount   int
+	excluded  int // entries in dnsAll/ipAll currently withheld by exclusions
 	sourcesOK int
-	updatedAt time.Time
+	updatedAt time.Time // last upstream refresh
+	builtAt   time.Time // when these chunks were built (ETag source)
 }
 
 type store struct {
 	cfg    config
 	client *http.Client
+	excl   *exclusionStore
 	cur    atomic.Pointer[snapshot]
-	mu     sync.Mutex // serializes refreshes
+	mu     sync.Mutex // serializes refreshes and exclusion-driven rebuilds
+}
+
+// buildSnapshot derives served chunks from the full sorted entries by
+// dropping exact-match exclusions.
+func (s *store) buildSnapshot(dnsAll, ipAll []string, sourcesOK int, updatedAt time.Time) *snapshot {
+	var exclDNS, exclIPs map[string]struct{}
+	if s.excl != nil {
+		exclDNS, exclIPs = s.excl.sets()
+	}
+	dnsServed, dnsDropped := filterExcluded(dnsAll, exclDNS)
+	ipServed, ipDropped := filterExcluded(ipAll, exclIPs)
+	return &snapshot{
+		dnsAll:    dnsAll,
+		ipAll:     ipAll,
+		dnsServed: dnsServed,
+		ipServed:  ipServed,
+		dnsChunks: chunkStrings(dnsServed, s.cfg.chunkSize),
+		ipChunks:  chunkStrings(ipServed, s.cfg.chunkSize),
+		dnsCount:  len(dnsServed),
+		ipCount:   len(ipServed),
+		excluded:  dnsDropped + ipDropped,
+		sourcesOK: sourcesOK,
+		updatedAt: updatedAt,
+		builtAt:   time.Now(),
+	}
+}
+
+// rebuild re-derives the served chunks from the current snapshot's full
+// entries after an exclusion change. No-op when nothing is loaded yet.
+func (s *store) rebuild() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	snap := s.cur.Load()
+	if snap == nil {
+		return
+	}
+	s.cur.Store(s.buildSnapshot(snap.dnsAll, snap.ipAll, snap.sourcesOK, snap.updatedAt))
 }
 
 func chunkStrings(entries []string, size int) [][]string {
@@ -184,20 +236,14 @@ func (s *store) refresh(ctx context.Context) error {
 	}
 	sortIPs(ips)
 
-	s.cur.Store(&snapshot{
-		dnsChunks: chunkStrings(dns, s.cfg.chunkSize),
-		ipChunks:  chunkStrings(ips, s.cfg.chunkSize),
-		dnsCount:  len(dns),
-		ipCount:   len(ips),
-		sourcesOK: okCount,
-		updatedAt: time.Now(),
-	})
+	s.cur.Store(s.buildSnapshot(dns, ips, okCount, time.Now()))
 	for _, f := range failures {
 		log.Printf("source failed (others still applied): %s", f)
 	}
-	log.Printf("refreshed: %d DNS + %d IP unique entries from %d/%d sources -> %d DNS chunk(s), %d IP chunk(s) of <= %d",
+	snap := s.cur.Load()
+	log.Printf("refreshed: %d DNS + %d IP unique entries from %d/%d sources -> %d DNS chunk(s), %d IP chunk(s) of <= %d (%d withheld by exclusions)",
 		len(dns), len(ips), okCount, len(s.cfg.sources),
-		len(s.cur.Load().dnsChunks), len(s.cur.Load().ipChunks), s.cfg.chunkSize)
+		len(snap.dnsChunks), len(snap.ipChunks), s.cfg.chunkSize, snap.excluded)
 	return nil
 }
 
@@ -206,7 +252,14 @@ func main() {
 	if err != nil {
 		log.Fatalf("config: %v", err)
 	}
-	st := &store{cfg: cfg, client: &http.Client{}}
+	excl, err := loadExclusions(cfg.exclusionsFile)
+	if err != nil {
+		log.Printf("exclusions: %v (starting with none; file will be rewritten on first change)", err)
+		excl = emptyExclusions(cfg.exclusionsFile)
+	} else if n := excl.count(); n > 0 {
+		log.Printf("exclusions: loaded %d from %s", n, cfg.exclusionsFile)
+	}
+	st := &store{cfg: cfg, client: &http.Client{}, excl: excl}
 
 	ctx := context.Background()
 	if err := st.refresh(ctx); err != nil {

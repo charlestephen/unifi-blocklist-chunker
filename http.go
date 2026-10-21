@@ -49,6 +49,12 @@ func (s *store) routes() http.Handler {
 	mux.HandleFunc("GET /healthz", s.handleHealth)
 	mux.HandleFunc("GET /stats", s.handleStats)
 	mux.HandleFunc("POST /refresh", s.handleRefresh)
+	mux.HandleFunc("GET /search", s.handleSearch)
+	mux.HandleFunc("GET /exclusions", s.handleListExclusions)
+	mux.HandleFunc("POST /exclusions", s.handleAddExclusion)
+	mux.HandleFunc("DELETE /exclusions", s.handleRemoveExclusion)
+	mux.HandleFunc("DELETE /exclusions/{entry...}", s.handleRemoveExclusion)
+	mux.HandleFunc("GET /manage", s.handleManage)
 	return mux
 }
 
@@ -96,7 +102,7 @@ func (s *store) handleChunk(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("Cache-Control", "public, max-age=3600")
-	w.Header().Set("ETag", fmt.Sprintf(`"%d-%s"`, snap.updatedAt.Unix(), name))
+	w.Header().Set("ETag", fmt.Sprintf(`"%d-%s"`, snap.builtAt.UnixNano(), name))
 	for _, e := range chunks[n-1] {
 		fmt.Fprintln(w, e)
 	}
@@ -120,18 +126,27 @@ func (s *store) handleStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	dnsURLs, ipURLs := chunkURLs(s.baseURLFor(r), snap)
+	exclusionsTotal := 0
+	if s.excl != nil {
+		exclusionsTotal = s.excl.count()
+	}
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"chunk_size":   s.cfg.chunkSize,
-		"dns_entries":  snap.dnsCount,
-		"ip_entries":   snap.ipCount,
-		"dns_chunks":   len(dnsURLs),
-		"ip_chunks":    len(ipURLs),
-		"sources_ok":   snap.sourcesOK,
-		"sources":      len(s.cfg.sources),
-		"updated_at":   snap.updatedAt.Format(time.RFC3339),
-		"dns_urls":     dnsURLs,
-		"ip_urls":      ipURLs,
-		"refresh_secs": int(s.cfg.refresh.Seconds()),
+		"chunk_size":          s.cfg.chunkSize,
+		"dns_entries":         snap.dnsCount,
+		"ip_entries":          snap.ipCount,
+		"dns_entries_total":   len(snap.dnsAll),
+		"ip_entries_total":    len(snap.ipAll),
+		"exclusions_total":    exclusionsTotal,
+		"exclusions_active":   snap.excluded,
+		"admin_auth_required": s.cfg.adminToken != "",
+		"dns_chunks":          len(dnsURLs),
+		"ip_chunks":           len(ipURLs),
+		"sources_ok":          snap.sourcesOK,
+		"sources":             len(s.cfg.sources),
+		"updated_at":          snap.updatedAt.Format(time.RFC3339),
+		"dns_urls":            dnsURLs,
+		"ip_urls":             ipURLs,
+		"refresh_secs":        int(s.cfg.refresh.Seconds()),
 	})
 }
 
