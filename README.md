@@ -93,22 +93,41 @@ as upstream lists grow or shrink.
 
 ## Configuration (environment)
 
-| Variable | Default | Description |
-| --- | --- | --- |
-| `BLOCKLIST_URLS` | *(required)* | Source list URLs, separated by commas, spaces, or newlines |
-| `CHUNK_SIZE` | `100000` | Max entries per output chunk |
-| `PORT` | `8080` | Listen port |
-| `REFRESH_INTERVAL` | `6h` | Re-fetch interval (Go duration; `0` disables periodic refresh) |
-| `BASE_URL` | *(unset)* | Public base URL for generated chunk links, e.g. `https://lists.example.com` |
-| `ADMIN_TOKEN` | *(unset)* | Token gating `GET /manage` and the exclusion endpoints; unset disables them (`503`) |
-| `EXCLUSIONS_FILE` | `exclusions.json` | Where exclusions are persisted; put it on a volume to survive restarts (published image: `/data/exclusions.json`) |
+Every runtime knob is an environment variable. There is no config file besides
+the exclusions JSON written by the process itself.
+
+| Variable | Default | Required | Description |
+| --- | --- | --- | --- |
+| `BLOCKLIST_URLS` | *(none)* | **yes** | Upstream list URLs. Separators: comma, space, tab, or newline. Each URL is fetched independently; a failed URL is logged and skipped. Formats: txt / hosts / adblock, JSON, YAML, TOML (detected by extension, `Content-Type`, or sniffing). |
+| `CHUNK_SIZE` | `100000` | no | Max entries per served chunk file. UniFi's external-blocklist field commonly caps around 100000; lower it if a controller rejects a chunk. Must be a positive integer. |
+| `PORT` | `8080` | no | Listen port inside the container. Keep in sync with published/mapped ports. |
+| `REFRESH_INTERVAL` | `6h` | no | How often sources are re-fetched. Go duration (`30m`, `6h`, `24h`, …). `0` disables the ticker (manual `POST /refresh` only). |
+| `BASE_URL` | *(unset)* | no | Public origin used when generating chunk URLs on `/` and `/stats` (no trailing slash), e.g. `https://lists.example.com`. When unset, the request's `X-Forwarded-Proto` / `X-Forwarded-Host` / `X-Forwarded-Prefix` (or the request's own scheme/host) are used — the usual Traefik / reverse-proxy path. |
+| `ADMIN_TOKEN` | *(unset)* | no | Shared secret for `GET /manage` and all `/exclusions` mutations. Send as `Authorization: Bearer <token>` or as the **password** of HTTP Basic auth (any username). **Unset = fail-closed:** those endpoints return `503`; public chunk/search/stats endpoints stay open. Set this whenever `/manage` or on-the-fly removals should work. |
+| `EXCLUSIONS_FILE` | `exclusions.json` | no | Path of the persisted exclusions JSON (atomic write-rename). Put it on a volume so removals survive restarts. In the published image the conventional path is `/data/exclusions.json` (see Compose / `podman run` examples). Corrupt file → log + start empty (file rewritten on the next change). |
+
+### Notes
+
+- **No other env vars** are read. Fetch size limit (128 MiB per source) is
+  compile-time, not configurable.
+- `BLOCKLIST_URLS` must be non-empty or the process exits on startup.
+- Exclusions are **not** configured via env; seed them through the API /
+  `/manage`, or by placing a valid JSON file at `EXCLUSIONS_FILE` before
+  start (`{"dns":["example.com"],"ips":["1.2.3.4"]}`).
+- Changing env vars requires a container restart. Exclusion add/remove via
+  API takes effect immediately without restart.
 
 ## Reverse proxy
 
-Behind a proxy that terminates HTTPS, leave `BASE_URL` unset: generated URLs
-are derived from `X-Forwarded-Proto`, `X-Forwarded-Host`, and
-`X-Forwarded-Prefix` (falling back to the request's own scheme/host). Set
-`BASE_URL` to pin an exact public origin regardless of headers.
+Behind a proxy that terminates HTTPS (Traefik, nginx, Caddy, …):
+
+1. Leave `BASE_URL` unset so generated chunk links pick up the public
+   origin from `X-Forwarded-*` headers.
+2. Or set `BASE_URL` to the exact public origin if your proxy does not
+   forward those headers reliably.
+3. Open `https://<public-host>/` for the plain-text index of chunk URLs to
+   paste into UniFi; open `https://<public-host>/manage` (Basic auth,
+   password = `ADMIN_TOKEN`) to search and exclude entries on the fly.
 
 ## Run
 
