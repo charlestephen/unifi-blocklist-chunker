@@ -19,11 +19,24 @@ type config struct {
 	port           string
 	chunkSize      int
 	sources        []string
+	exclusionURLs  []string
 	refresh        time.Duration
 	baseURL        string
 	fetchLimit     int64
 	adminToken     string
 	exclusionsFile string
+}
+
+func splitURLs(raw string) []string {
+	var out []string
+	for _, u := range strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ',' || r == '\n' || r == '\t' || r == ' '
+	}) {
+		if u != "" {
+			out = append(out, u)
+		}
+	}
+	return out
 }
 
 func loadConfig() (config, error) {
@@ -50,16 +63,11 @@ func loadConfig() (config, error) {
 		}
 		cfg.refresh = d
 	}
-	for _, u := range strings.FieldsFunc(os.Getenv("BLOCKLIST_URLS"), func(r rune) bool {
-		return r == ',' || r == '\n' || r == '\t' || r == ' '
-	}) {
-		if u != "" {
-			cfg.sources = append(cfg.sources, u)
-		}
-	}
+	cfg.sources = splitURLs(os.Getenv("BLOCKLIST_URLS"))
 	if len(cfg.sources) == 0 {
 		return cfg, fmt.Errorf("BLOCKLIST_URLS is required (comma-separated list URLs)")
 	}
+	cfg.exclusionURLs = splitURLs(os.Getenv("EXCLUSIONS_URLS"))
 	return cfg, nil
 }
 
@@ -98,8 +106,67 @@ type store struct {
 	cfg    config
 	client *http.Client
 	excl   *exclusionStore
-	cur    atomic.Pointer[snapshot]
-	mu     sync.Mutex // serializes refreshes and exclusion-driven rebuilds
+	// urlDNS/urlIPs are rebuilt from EXCLUSIONS_URLS on each successful
+	// exclusion-list fetch. They are not persisted; remote lists are the
+	// source of truth. Effective exclusions = persistent ∪ URL-sourced.
+	urlExclMu sync.RWMutex
+	urlDNS    map[string]struct{}
+	urlIPs    map[string]struct{}
+	cur       atomic.Pointer[snapshot]
+	mu        sync.Mutex // serializes refreshes and exclusion-driven rebuilds
+}
+
+// effectiveExclusions merges persistent file exclusions with the latest
+// URL-seeded set.
+func (s *store) effectiveExclusions() (dns, ips map[string]struct{}) {
+	if s.excl != nil {
+		dns, ips = s.excl.sets()
+	} else {
+		dns, ips = map[string]struct{}{}, map[string]struct{}{}
+	}
+	s.urlExclMu.RLock()
+	defer s.urlExclMu.RUnlock()
+	for k := range s.urlDNS {
+		dns[k] = struct{}{}
+	}
+	for k := range s.urlIPs {
+		ips[k] = struct{}{}
+	}
+	return dns, ips
+}
+
+func (s *store) isExcluded(entry string, isIP bool) bool {
+	if s.excl != nil && s.excl.contains(entry, isIP) {
+		return true
+	}
+	s.urlExclMu.RLock()
+	defer s.urlExclMu.RUnlock()
+	if isIP {
+		_, ok := s.urlIPs[entry]
+		return ok
+	}
+	_, ok := s.urlDNS[entry]
+	return ok
+}
+
+func (s *store) urlExclusionCount() int {
+	s.urlExclMu.RLock()
+	defer s.urlExclMu.RUnlock()
+	return len(s.urlDNS) + len(s.urlIPs)
+}
+
+func (s *store) urlExclusionSets() (dns, ips map[string]struct{}) {
+	s.urlExclMu.RLock()
+	defer s.urlExclMu.RUnlock()
+	dns = make(map[string]struct{}, len(s.urlDNS))
+	for k := range s.urlDNS {
+		dns[k] = struct{}{}
+	}
+	ips = make(map[string]struct{}, len(s.urlIPs))
+	for k := range s.urlIPs {
+		ips[k] = struct{}{}
+	}
+	return dns, ips
 }
 
 // isIPv4Entry reports whether a normalized IP/CIDR belongs on the IPv4
@@ -126,16 +193,13 @@ func splitByIPFamily(ips []string) (v4, v6 []string) {
 }
 
 // buildSnapshot derives served chunks from the full sorted entries by
-// dropping exact-match exclusions. IP entries are split into IPv4 and
-// IPv6 chunk streams.
+// dropping exact-match exclusions (persistent file ∪ EXCLUSIONS_URLS).
+// IP entries are split into IPv4 and IPv6 chunk streams.
 func (s *store) buildSnapshot(dnsAll, ipv4All, ipv6All []string, sourcesOK int, updatedAt time.Time) *snapshot {
 	sortDomains(dnsAll)
 	sortIPs(ipv4All)
 	sortIPs(ipv6All)
-	var exclDNS, exclIPs map[string]struct{}
-	if s.excl != nil {
-		exclDNS, exclIPs = s.excl.sets()
-	}
+	exclDNS, exclIPs := s.effectiveExclusions()
 	dnsServed, dnsDropped := filterExcluded(dnsAll, exclDNS)
 	ipv4Served, ipv4Dropped := filterExcluded(ipv4All, exclIPs)
 	ipv6Served, ipv6Dropped := filterExcluded(ipv6All, exclIPs)
@@ -200,12 +264,58 @@ func (s *store) fetchOne(ctx context.Context, url string) (dns, ips []string, er
 	return parseList(url, resp.Header.Get("Content-Type"), body)
 }
 
+// refreshExclusionURLs fetches EXCLUSIONS_URLS and replaces the in-memory
+// URL-sourced exclusion sets when at least one URL succeeds. Total failure
+// keeps the previous URL-sourced set. No URLs configured clears them.
+func (s *store) refreshExclusionURLs(ctx context.Context) {
+	if len(s.cfg.exclusionURLs) == 0 {
+		s.urlExclMu.Lock()
+		s.urlDNS, s.urlIPs = nil, nil
+		s.urlExclMu.Unlock()
+		return
+	}
+	dnsSet := make(map[string]struct{})
+	ipSet := make(map[string]struct{})
+	ok := 0
+	var failures []string
+	for _, url := range s.cfg.exclusionURLs {
+		fetchCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
+		dns, ips, err := s.fetchOne(fetchCtx, url)
+		cancel()
+		if err != nil {
+			failures = append(failures, fmt.Sprintf("%s: %v", url, err))
+			continue
+		}
+		ok++
+		for _, e := range dns {
+			dnsSet[e] = struct{}{}
+		}
+		for _, e := range ips {
+			ipSet[e] = struct{}{}
+		}
+	}
+	for _, f := range failures {
+		log.Printf("exclusion source failed (others still applied): %s", f)
+	}
+	if ok == 0 {
+		log.Printf("exclusion sources: all %d failed; keeping previous URL exclusions", len(s.cfg.exclusionURLs))
+		return
+	}
+	s.urlExclMu.Lock()
+	s.urlDNS, s.urlIPs = dnsSet, ipSet
+	s.urlExclMu.Unlock()
+	log.Printf("exclusion sources: loaded %d DNS + %d IP from %d/%d URL(s)",
+		len(dnsSet), len(ipSet), ok, len(s.cfg.exclusionURLs))
+}
+
 // refresh fetches every source, deduplicates across all of them (separately
 // per entry class), sorts, and atomically swaps in the new chunked snapshot.
 // A refresh that yields zero entries keeps the previous snapshot.
 func (s *store) refresh(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	s.refreshExclusionURLs(ctx)
 
 	dnsSet := make(map[string]struct{})
 	ipSet := make(map[string]struct{})
@@ -270,6 +380,9 @@ func main() {
 		log.Printf("exclusions: loaded %d from %s", n, cfg.exclusionsFile)
 	}
 	st := &store{cfg: cfg, client: &http.Client{}, excl: excl}
+	if n := len(cfg.exclusionURLs); n > 0 {
+		log.Printf("exclusions: %d URL source(s) configured (fetched on each refresh)", n)
+	}
 
 	ctx := context.Background()
 	if err := st.refresh(ctx); err != nil {

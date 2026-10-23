@@ -135,31 +135,35 @@ func (s *store) handleStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	dnsURLs, ipv4URLs, ipv6URLs := chunkURLs(s.baseURLFor(r), snap)
-	exclusionsTotal := 0
+	exclusionsPersistent := 0
 	if s.excl != nil {
-		exclusionsTotal = s.excl.count()
+		exclusionsPersistent = s.excl.count()
 	}
+	exclusionsFromURLs := s.urlExclusionCount()
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"chunk_size":          s.cfg.chunkSize,
-		"dns_entries":         snap.dnsCount,
-		"ipv4_entries":        snap.ipv4Count,
-		"ipv6_entries":        snap.ipv6Count,
-		"dns_entries_total":   len(snap.dnsAll),
-		"ipv4_entries_total":  len(snap.ipv4All),
-		"ipv6_entries_total":  len(snap.ipv6All),
-		"exclusions_total":    exclusionsTotal,
-		"exclusions_active":   snap.excluded,
-		"admin_auth_required": s.cfg.adminToken != "",
-		"dns_chunks":          len(dnsURLs),
-		"ipv4_chunks":         len(ipv4URLs),
-		"ipv6_chunks":         len(ipv6URLs),
-		"sources_ok":          snap.sourcesOK,
-		"sources":             len(s.cfg.sources),
-		"updated_at":          snap.updatedAt.Format(time.RFC3339),
-		"dns_urls":            dnsURLs,
-		"ipv4_urls":           ipv4URLs,
-		"ipv6_urls":           ipv6URLs,
-		"refresh_secs":        int(s.cfg.refresh.Seconds()),
+		"chunk_size":            s.cfg.chunkSize,
+		"dns_entries":           snap.dnsCount,
+		"ipv4_entries":          snap.ipv4Count,
+		"ipv6_entries":          snap.ipv6Count,
+		"dns_entries_total":     len(snap.dnsAll),
+		"ipv4_entries_total":    len(snap.ipv4All),
+		"ipv6_entries_total":    len(snap.ipv6All),
+		"exclusions_total":      exclusionsPersistent + exclusionsFromURLs,
+		"exclusions_persistent": exclusionsPersistent,
+		"exclusions_from_urls":  exclusionsFromURLs,
+		"exclusions_active":     snap.excluded,
+		"exclusion_urls":        len(s.cfg.exclusionURLs),
+		"admin_auth_required":   s.cfg.adminToken != "",
+		"dns_chunks":            len(dnsURLs),
+		"ipv4_chunks":           len(ipv4URLs),
+		"ipv6_chunks":           len(ipv6URLs),
+		"sources_ok":            snap.sourcesOK,
+		"sources":               len(s.cfg.sources),
+		"updated_at":            snap.updatedAt.Format(time.RFC3339),
+		"dns_urls":              dnsURLs,
+		"ipv4_urls":             ipv4URLs,
+		"ipv6_urls":             ipv6URLs,
+		"refresh_secs":          int(s.cfg.refresh.Seconds()),
 	})
 }
 

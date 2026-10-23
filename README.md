@@ -105,17 +105,17 @@ the exclusions JSON written by the process itself.
 | `BASE_URL` | *(unset)* | no | Public origin used when generating chunk URLs on `/` and `/stats` (no trailing slash), e.g. `https://lists.example.com`. When unset, the request's `X-Forwarded-Proto` / `X-Forwarded-Host` / `X-Forwarded-Prefix` (or the request's own scheme/host) are used — the usual Traefik / reverse-proxy path. |
 | `ADMIN_TOKEN` | *(unset)* | no | Shared secret for `GET /manage` and all `/exclusions` mutations. Send as `Authorization: Bearer <token>` or as the **password** of HTTP Basic auth (any username). **Unset = fail-closed:** those endpoints return `503`; public chunk/search/stats endpoints stay open. Set this whenever `/manage` or on-the-fly removals should work. |
 | `EXCLUSIONS_FILE` | `exclusions.json` | no | Path of the persisted exclusions JSON (atomic write-rename). Put it on a volume so removals survive restarts. In the published image the conventional path is `/data/exclusions.json` (see Compose / `podman run` examples). Corrupt file → log + start empty (file rewritten on the next change). |
+| `EXCLUSIONS_URLS` | *(unset)* | no | Remote exclusion list URLs (same separators and formats as `BLOCKLIST_URLS`). Fetched on every refresh; entries are unioned with the persistent file. Remote lists are not written to `EXCLUSIONS_FILE` — edit the remote file (e.g. `https://lists.example.com/excluded.txt`) to add/remove URL-sourced exclusions. A total fetch failure keeps the previous URL-sourced set. |
 
 ### Notes
 
-- **No other env vars** are read. Fetch size limit (128 MiB per source) is
-  compile-time, not configurable.
+- Fetch size limit (128 MiB per source) is compile-time, not configurable.
 - `BLOCKLIST_URLS` must be non-empty or the process exits on startup.
-- Exclusions are **not** configured via env; seed them through the API /
-  `/manage`, or by placing a valid JSON file at `EXCLUSIONS_FILE` before
-  start (`{"dns":["example.com"],"ips":["1.2.3.4"]}`).
-- Changing env vars requires a container restart. Exclusion add/remove via
-  API takes effect immediately without restart.
+- Effective exclusions = persistent file ∪ `EXCLUSIONS_URLS`. Seed via API /
+  `/manage`, a JSON file at `EXCLUSIONS_FILE`, and/or remote exclusion lists.
+- Changing env vars requires a container restart. Persistent exclusion
+  add/remove via API takes effect immediately; URL-sourced exclusions update
+  on the next refresh.
 
 ## Reverse proxy
 

@@ -24,6 +24,9 @@ services:
       ADMIN_TOKEN: "${ADMIN_TOKEN:-}"
       # Persisted exclusions, on the volume below so they survive restarts.
       EXCLUSIONS_FILE: "/data/exclusions.json"
+      # Optional remote exclusion lists (same formats as BLOCKLIST_URLS),
+      # re-fetched on each refresh. Example: https://lists.example.com/excluded.txt
+      # EXCLUSIONS_URLS: "https://lists.example.com/excluded.txt"
     volumes:
       - blocklist-data:/data
     ports:

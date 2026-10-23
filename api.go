@@ -157,7 +157,7 @@ func (s *store) search(snap *snapshot, base, raw string) (searchResult, bool) {
 		return searchResult{}, false
 	}
 	res := searchResult{Query: raw, Normalized: entry, Type: entryType(entry, isIP)}
-	res.Excluded = s.excl != nil && s.excl.contains(entry, isIP)
+	res.Excluded = s.isExcluded(entry, isIP)
 	inAll, inServed := findEntry(snap, entry, isIP)
 	res.InSnapshot = inAll >= 0
 	if inServed >= 0 {
@@ -230,7 +230,26 @@ func (s *store) handleListExclusions(w http.ResponseWriter, r *http.Request) {
 	if ips == nil {
 		ips = []string{}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"dns": dns, "ips": ips, "count": len(dns) + len(ips)})
+	urlDNS, urlIPs := s.urlExclusionSets()
+	urlDNSList := make([]string, 0, len(urlDNS))
+	for e := range urlDNS {
+		urlDNSList = append(urlDNSList, e)
+	}
+	sortDomains(urlDNSList)
+	urlIPList := make([]string, 0, len(urlIPs))
+	for e := range urlIPs {
+		urlIPList = append(urlIPList, e)
+	}
+	sortIPs(urlIPList)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"dns":             dns,
+		"ips":             ips,
+		"count":           len(dns) + len(ips),
+		"from_urls_dns":   urlDNSList,
+		"from_urls_ips":   urlIPList,
+		"from_urls_count": len(urlDNSList) + len(urlIPList),
+		"exclusion_urls":  s.cfg.exclusionURLs,
+	})
 }
 
 func (s *store) handleAddExclusion(w http.ResponseWriter, r *http.Request) {
@@ -255,7 +274,16 @@ func (s *store) handleAddExclusion(w http.ResponseWriter, r *http.Request) {
 	if changed {
 		status = http.StatusCreated
 	}
-	resp := map[string]any{"entry": entry, "type": entryType(entry, isIP), "excluded": true, "changed": changed}
+	fromURL := false
+	if ud, ui := s.urlExclusionSets(); isIP {
+		_, fromURL = ui[entry]
+	} else {
+		_, fromURL = ud[entry]
+	}
+	resp := map[string]any{
+		"entry": entry, "type": entryType(entry, isIP), "excluded": true,
+		"changed": changed, "from_url": fromURL,
+	}
 	if snap := s.cur.Load(); snap != nil {
 		inAll, _ := findEntry(snap, entry, isIP)
 		resp["in_snapshot"] = inAll >= 0
@@ -275,7 +303,23 @@ func (s *store) handleRemoveExclusion(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	if !s.excl.contains(entry, isIP) {
+	inPersistent := s.excl != nil && s.excl.contains(entry, isIP)
+	ud, ui := s.urlExclusionSets()
+	inURL := false
+	if isIP {
+		_, inURL = ui[entry]
+	} else {
+		_, inURL = ud[entry]
+	}
+	if !inPersistent {
+		if inURL {
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"error":    "entry is excluded only via EXCLUSIONS_URLS; remove it from that remote list",
+				"entry":    entry,
+				"from_url": true,
+			})
+			return
+		}
 		writeJSON(w, http.StatusNotFound, map[string]any{
 			"error": "entry is not excluded", "entry": entry,
 		})
@@ -286,7 +330,11 @@ func (s *store) handleRemoveExclusion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.rebuild()
-	resp := map[string]any{"entry": entry, "type": entryType(entry, isIP), "excluded": false, "restored": true}
+	stillExcluded := s.isExcluded(entry, isIP)
+	resp := map[string]any{
+		"entry": entry, "type": entryType(entry, isIP),
+		"excluded": stillExcluded, "restored": !stillExcluded, "from_url": stillExcluded,
+	}
 	if snap := s.cur.Load(); snap != nil {
 		inAll, inServed := findEntry(snap, entry, isIP)
 		resp["in_snapshot"] = inAll >= 0

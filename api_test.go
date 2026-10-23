@@ -249,10 +249,31 @@ func TestStatsExclusionCounts(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &stats); err != nil {
 		t.Fatal(err)
 	}
-	if stats["exclusions_total"] != float64(1) || stats["exclusions_active"] != float64(1) ||
+	if stats["exclusions_total"] != float64(1) || stats["exclusions_persistent"] != float64(1) ||
+		stats["exclusions_from_urls"] != float64(0) || stats["exclusions_active"] != float64(1) ||
 		stats["ipv4_entries"] != float64(1) || stats["ipv4_entries_total"] != float64(2) ||
 		stats["ipv6_entries"] != float64(2) || stats["ipv6_entries_total"] != float64(2) {
 		t.Fatalf("bad stats: %v", stats)
+	}
+}
+
+func TestURLSeededExclusions(t *testing.T) {
+	st := testStore(t, "secret")
+	st.urlExclMu.Lock()
+	st.urlDNS = map[string]struct{}{"example.com": {}}
+	st.urlIPs = map[string]struct{}{"9.9.9.9": {}}
+	st.urlExclMu.Unlock()
+	st.rebuild()
+	snap := st.cur.Load()
+	if snap.dnsCount != 2 || snap.ipv4Count != 1 || snap.excluded != 2 {
+		t.Fatalf("url exclusions not applied: dns=%d ipv4=%d excluded=%d", snap.dnsCount, snap.ipv4Count, snap.excluded)
+	}
+	if !st.isExcluded("example.com", false) || !st.isExcluded("9.9.9.9", true) {
+		t.Fatal("isExcluded missed URL-sourced entries")
+	}
+	// DELETE of a URL-only exclusion must Conflict, not silently succeed.
+	if rec := doReq(st, "DELETE", "/exclusions", `{"entry":"example.com"}`, "Bearer secret"); rec.Code != http.StatusConflict {
+		t.Fatalf("URL-only restore: status %d body %s", rec.Code, rec.Body)
 	}
 }
 
