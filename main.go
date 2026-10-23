@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"net/netip"
 	"os"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -72,22 +71,27 @@ func envOr(key, def string) string {
 }
 
 type snapshot struct {
-	// dnsAll/ipAll are the full sorted upstream entries; dnsServed/ipServed
-	// are the same minus persistent exclusions. The chunks serve the
-	// latter, so an exclusion can be applied or undone by re-chunking
-	// without a refetch.
-	dnsAll    []string
-	ipAll     []string
-	dnsServed []string
-	ipServed  []string
-	dnsChunks [][]string
-	ipChunks  [][]string
-	dnsCount  int
-	ipCount   int
-	excluded  int // entries in dnsAll/ipAll currently withheld by exclusions
-	sourcesOK int
-	updatedAt time.Time // last upstream refresh
-	builtAt   time.Time // when these chunks were built (ETag source)
+	// *All are the full sorted upstream entries; *Served are the same
+	// minus persistent exclusions. Chunks serve the latter so an
+	// exclusion can be applied or undone by re-chunking without a refetch.
+	// IPs are split by address family — UniFi expects IPv4 and IPv6 lists
+	// separately from domain lists.
+	dnsAll     []string
+	ipv4All    []string
+	ipv6All    []string
+	dnsServed  []string
+	ipv4Served []string
+	ipv6Served []string
+	dnsChunks  [][]string
+	ipv4Chunks [][]string
+	ipv6Chunks [][]string
+	dnsCount   int
+	ipv4Count  int
+	ipv6Count  int
+	excluded   int // entries currently withheld by exclusions
+	sourcesOK  int
+	updatedAt  time.Time // last upstream refresh
+	builtAt    time.Time // when these chunks were built (ETag source)
 }
 
 type store struct {
@@ -98,28 +102,60 @@ type store struct {
 	mu     sync.Mutex // serializes refreshes and exclusion-driven rebuilds
 }
 
+// isIPv4Entry reports whether a normalized IP/CIDR belongs on the IPv4
+// chunk stream. IPv4-mapped IPv6 addresses (::ffff:a.b.c.d) count as IPv4.
+func isIPv4Entry(entry string) bool {
+	if p, err := netip.ParsePrefix(entry); err == nil {
+		return p.Addr().Unmap().Is4()
+	}
+	if a, err := netip.ParseAddr(entry); err == nil {
+		return a.Unmap().Is4()
+	}
+	return false
+}
+
+func splitByIPFamily(ips []string) (v4, v6 []string) {
+	for _, e := range ips {
+		if isIPv4Entry(e) {
+			v4 = append(v4, e)
+		} else {
+			v6 = append(v6, e)
+		}
+	}
+	return v4, v6
+}
+
 // buildSnapshot derives served chunks from the full sorted entries by
-// dropping exact-match exclusions.
-func (s *store) buildSnapshot(dnsAll, ipAll []string, sourcesOK int, updatedAt time.Time) *snapshot {
+// dropping exact-match exclusions. IP entries are split into IPv4 and
+// IPv6 chunk streams.
+func (s *store) buildSnapshot(dnsAll, ipv4All, ipv6All []string, sourcesOK int, updatedAt time.Time) *snapshot {
+	sortDomains(dnsAll)
+	sortIPs(ipv4All)
+	sortIPs(ipv6All)
 	var exclDNS, exclIPs map[string]struct{}
 	if s.excl != nil {
 		exclDNS, exclIPs = s.excl.sets()
 	}
 	dnsServed, dnsDropped := filterExcluded(dnsAll, exclDNS)
-	ipServed, ipDropped := filterExcluded(ipAll, exclIPs)
+	ipv4Served, ipv4Dropped := filterExcluded(ipv4All, exclIPs)
+	ipv6Served, ipv6Dropped := filterExcluded(ipv6All, exclIPs)
 	return &snapshot{
-		dnsAll:    dnsAll,
-		ipAll:     ipAll,
-		dnsServed: dnsServed,
-		ipServed:  ipServed,
-		dnsChunks: chunkStrings(dnsServed, s.cfg.chunkSize),
-		ipChunks:  chunkStrings(ipServed, s.cfg.chunkSize),
-		dnsCount:  len(dnsServed),
-		ipCount:   len(ipServed),
-		excluded:  dnsDropped + ipDropped,
-		sourcesOK: sourcesOK,
-		updatedAt: updatedAt,
-		builtAt:   time.Now(),
+		dnsAll:     dnsAll,
+		ipv4All:    ipv4All,
+		ipv6All:    ipv6All,
+		dnsServed:  dnsServed,
+		ipv4Served: ipv4Served,
+		ipv6Served: ipv6Served,
+		dnsChunks:  chunkStrings(dnsServed, s.cfg.chunkSize),
+		ipv4Chunks: chunkStrings(ipv4Served, s.cfg.chunkSize),
+		ipv6Chunks: chunkStrings(ipv6Served, s.cfg.chunkSize),
+		dnsCount:   len(dnsServed),
+		ipv4Count:  len(ipv4Served),
+		ipv6Count:  len(ipv6Served),
+		excluded:   dnsDropped + ipv4Dropped + ipv6Dropped,
+		sourcesOK:  sourcesOK,
+		updatedAt:  updatedAt,
+		builtAt:    time.Now(),
 	}
 }
 
@@ -132,7 +168,7 @@ func (s *store) rebuild() {
 	if snap == nil {
 		return
 	}
-	s.cur.Store(s.buildSnapshot(snap.dnsAll, snap.ipAll, snap.sourcesOK, snap.updatedAt))
+	s.cur.Store(s.buildSnapshot(snap.dnsAll, snap.ipv4All, snap.ipv6All, snap.sourcesOK, snap.updatedAt))
 }
 
 func chunkStrings(entries []string, size int) [][]string {
@@ -141,33 +177,6 @@ func chunkStrings(entries []string, size int) [][]string {
 		chunks = append(chunks, entries[start:min(start+size, len(entries))])
 	}
 	return chunks
-}
-
-func sortIPs(entries []string) {
-	type keyed struct {
-		text string
-		addr netip.Addr
-		bits int
-	}
-	ks := make([]keyed, len(entries))
-	for i, e := range entries {
-		k := keyed{text: e, bits: -1}
-		if p, err := netip.ParsePrefix(e); err == nil {
-			k.addr, k.bits = p.Addr(), p.Bits()
-		} else if a, err := netip.ParseAddr(e); err == nil {
-			k.addr = a
-		}
-		ks[i] = k
-	}
-	sort.Slice(ks, func(i, j int) bool {
-		if c := ks[i].addr.Compare(ks[j].addr); c != 0 {
-			return c < 0
-		}
-		return ks[i].bits < ks[j].bits
-	})
-	for i := range ks {
-		entries[i] = ks[i].text
-	}
 }
 
 func (s *store) fetchOne(ctx context.Context, url string) (dns, ips []string, err error) {
@@ -229,21 +238,22 @@ func (s *store) refresh(ctx context.Context) error {
 	for e := range dnsSet {
 		dns = append(dns, e)
 	}
-	sort.Strings(dns)
+	sortDomains(dns)
 	ips := make([]string, 0, len(ipSet))
 	for e := range ipSet {
 		ips = append(ips, e)
 	}
 	sortIPs(ips)
+	ipv4, ipv6 := splitByIPFamily(ips)
 
-	s.cur.Store(s.buildSnapshot(dns, ips, okCount, time.Now()))
+	s.cur.Store(s.buildSnapshot(dns, ipv4, ipv6, okCount, time.Now()))
 	for _, f := range failures {
 		log.Printf("source failed (others still applied): %s", f)
 	}
 	snap := s.cur.Load()
-	log.Printf("refreshed: %d DNS + %d IP unique entries from %d/%d sources -> %d DNS chunk(s), %d IP chunk(s) of <= %d (%d withheld by exclusions)",
-		len(dns), len(ips), okCount, len(s.cfg.sources),
-		len(snap.dnsChunks), len(snap.ipChunks), s.cfg.chunkSize, snap.excluded)
+	log.Printf("refreshed: %d DNS + %d IPv4 + %d IPv6 unique entries from %d/%d sources -> %d DNS / %d IPv4 / %d IPv6 chunk(s) of <= %d (%d withheld by exclusions)",
+		len(dns), len(ipv4), len(ipv6), okCount, len(s.cfg.sources),
+		len(snap.dnsChunks), len(snap.ipv4Chunks), len(snap.ipv6Chunks), s.cfg.chunkSize, snap.excluded)
 	return nil
 }
 

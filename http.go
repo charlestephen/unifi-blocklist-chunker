@@ -32,14 +32,17 @@ func (s *store) baseURLFor(r *http.Request) string {
 	return scheme + "://" + host + prefix
 }
 
-func chunkURLs(base string, snap *snapshot) (dnsURLs, ipURLs []string) {
+func chunkURLs(base string, snap *snapshot) (dnsURLs, ipv4URLs, ipv6URLs []string) {
 	for i := range snap.dnsChunks {
 		dnsURLs = append(dnsURLs, fmt.Sprintf("%s/lists/dns-%d.txt", base, i+1))
 	}
-	for i := range snap.ipChunks {
-		ipURLs = append(ipURLs, fmt.Sprintf("%s/lists/ip-%d.txt", base, i+1))
+	for i := range snap.ipv4Chunks {
+		ipv4URLs = append(ipv4URLs, fmt.Sprintf("%s/lists/ipv4-%d.txt", base, i+1))
 	}
-	return dnsURLs, ipURLs
+	for i := range snap.ipv6Chunks {
+		ipv6URLs = append(ipv6URLs, fmt.Sprintf("%s/lists/ipv6-%d.txt", base, i+1))
+	}
+	return dnsURLs, ipv4URLs, ipv6URLs
 }
 
 func (s *store) routes() http.Handler {
@@ -66,13 +69,17 @@ func (s *store) handleIndex(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintln(w, "# no lists loaded yet")
 		return
 	}
-	dnsURLs, ipURLs := chunkURLs(s.baseURLFor(r), snap)
-	fmt.Fprintf(w, "# %d DNS entries in %d chunk(s)\n", snap.dnsCount, len(dnsURLs))
+	dnsURLs, ipv4URLs, ipv6URLs := chunkURLs(s.baseURLFor(r), snap)
+	fmt.Fprintf(w, "# %d domain entries in %d chunk(s)\n", snap.dnsCount, len(dnsURLs))
 	for _, u := range dnsURLs {
 		fmt.Fprintln(w, u)
 	}
-	fmt.Fprintf(w, "# %d IP entries in %d chunk(s)\n", snap.ipCount, len(ipURLs))
-	for _, u := range ipURLs {
+	fmt.Fprintf(w, "# %d IPv4 entries in %d chunk(s)\n", snap.ipv4Count, len(ipv4URLs))
+	for _, u := range ipv4URLs {
+		fmt.Fprintln(w, u)
+	}
+	fmt.Fprintf(w, "# %d IPv6 entries in %d chunk(s)\n", snap.ipv6Count, len(ipv6URLs))
+	for _, u := range ipv6URLs {
 		fmt.Fprintln(w, u)
 	}
 }
@@ -89,8 +96,10 @@ func (s *store) handleChunk(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case strings.HasPrefix(name, "dns-"):
 		chunks, rest = snap.dnsChunks, strings.TrimPrefix(name, "dns-")
-	case strings.HasPrefix(name, "ip-"):
-		chunks, rest = snap.ipChunks, strings.TrimPrefix(name, "ip-")
+	case strings.HasPrefix(name, "ipv4-"):
+		chunks, rest = snap.ipv4Chunks, strings.TrimPrefix(name, "ipv4-")
+	case strings.HasPrefix(name, "ipv6-"):
+		chunks, rest = snap.ipv6Chunks, strings.TrimPrefix(name, "ipv6-")
 	default:
 		http.NotFound(w, r)
 		return
@@ -125,7 +134,7 @@ func (s *store) handleStats(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintln(w, `{"status":"no lists loaded yet"}`)
 		return
 	}
-	dnsURLs, ipURLs := chunkURLs(s.baseURLFor(r), snap)
+	dnsURLs, ipv4URLs, ipv6URLs := chunkURLs(s.baseURLFor(r), snap)
 	exclusionsTotal := 0
 	if s.excl != nil {
 		exclusionsTotal = s.excl.count()
@@ -133,19 +142,23 @@ func (s *store) handleStats(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"chunk_size":          s.cfg.chunkSize,
 		"dns_entries":         snap.dnsCount,
-		"ip_entries":          snap.ipCount,
+		"ipv4_entries":        snap.ipv4Count,
+		"ipv6_entries":        snap.ipv6Count,
 		"dns_entries_total":   len(snap.dnsAll),
-		"ip_entries_total":    len(snap.ipAll),
+		"ipv4_entries_total":  len(snap.ipv4All),
+		"ipv6_entries_total":  len(snap.ipv6All),
 		"exclusions_total":    exclusionsTotal,
 		"exclusions_active":   snap.excluded,
 		"admin_auth_required": s.cfg.adminToken != "",
 		"dns_chunks":          len(dnsURLs),
-		"ip_chunks":           len(ipURLs),
+		"ipv4_chunks":         len(ipv4URLs),
+		"ipv6_chunks":         len(ipv6URLs),
 		"sources_ok":          snap.sourcesOK,
 		"sources":             len(s.cfg.sources),
 		"updated_at":          snap.updatedAt.Format(time.RFC3339),
 		"dns_urls":            dnsURLs,
-		"ip_urls":             ipURLs,
+		"ipv4_urls":           ipv4URLs,
+		"ipv6_urls":           ipv6URLs,
 		"refresh_secs":        int(s.cfg.refresh.Seconds()),
 	})
 }

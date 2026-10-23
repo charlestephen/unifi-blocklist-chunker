@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -23,8 +24,9 @@ func testStore(t *testing.T, token string) *store {
 		excl:   excl,
 	}
 	dns := []string{"ads.example.com", "example.com", "tracker.example.com"}
-	ips := []string{"1.2.0.0/16", "9.9.9.9"}
-	st.cur.Store(st.buildSnapshot(dns, ips, 1, time.Now()))
+	ipv4 := []string{"1.2.0.0/16", "9.9.9.9"}
+	ipv6 := []string{"2001:db8::1", "2001:db8::/32"}
+	st.cur.Store(st.buildSnapshot(dns, ipv4, ipv6, 1, time.Now()))
 	return st
 }
 
@@ -113,10 +115,10 @@ func TestExcludeSurvivesRefreshRebuild(t *testing.T) {
 	}
 	// Simulate a refresh swapping in the same upstream entries.
 	st.cur.Store(st.buildSnapshot(
-		[]string{"example.com"}, []string{"9.9.9.9"}, 1, time.Now()))
+		[]string{"example.com"}, []string{"9.9.9.9"}, nil, 1, time.Now()))
 	snap := st.cur.Load()
-	if snap.ipCount != 0 || snap.excluded != 1 {
-		t.Fatalf("after rebuild: ipCount=%d excluded=%d", snap.ipCount, snap.excluded)
+	if snap.ipv4Count != 0 || snap.excluded != 1 {
+		t.Fatalf("after rebuild: ipv4Count=%d excluded=%d", snap.ipv4Count, snap.excluded)
 	}
 }
 
@@ -141,9 +143,28 @@ func TestSearchExactAndCovered(t *testing.T) {
 	}
 
 	rec = doReq(st, "GET", "/search?q=1.2.3.4", "", "")
-	_ = json.Unmarshal(rec.Body.Bytes(), &res)
-	if res.Found || res.CoveredBy != "1.2.0.0/16" || res.Type != "ip" {
+	if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil {
+		t.Fatal(err)
+	}
+	if res.Found || res.CoveredBy != "1.2.0.0/16" || res.Type != "ipv4" {
 		t.Fatalf("bad CIDR-covered search: %+v", res)
+	}
+
+	res = searchResult{}
+	rec = doReq(st, "GET", "/search?q=2001:db8::1", "", "")
+	if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil {
+		t.Fatal(err)
+	}
+	if !res.Found || res.Type != "ipv6" || res.Chunk != 1 {
+		t.Fatalf("bad IPv6 search: %+v", res)
+	}
+	res = searchResult{}
+	rec = doReq(st, "GET", "/search?q=2001:db8::99", "", "")
+	if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil {
+		t.Fatal(err)
+	}
+	if res.Found || res.CoveredBy != "2001:db8::/32" || res.Type != "ipv6" {
+		t.Fatalf("bad IPv6 covered search: %+v", res)
 	}
 
 	rec = doReq(st, "GET", "/search?q=not%20a%20domain", "", "")
@@ -228,7 +249,39 @@ func TestStatsExclusionCounts(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &stats); err != nil {
 		t.Fatal(err)
 	}
-	if stats["exclusions_total"] != float64(1) || stats["exclusions_active"] != float64(1) || stats["ip_entries"] != float64(1) || stats["ip_entries_total"] != float64(2) {
+	if stats["exclusions_total"] != float64(1) || stats["exclusions_active"] != float64(1) ||
+		stats["ipv4_entries"] != float64(1) || stats["ipv4_entries_total"] != float64(2) ||
+		stats["ipv6_entries"] != float64(2) || stats["ipv6_entries_total"] != float64(2) {
 		t.Fatalf("bad stats: %v", stats)
+	}
+}
+
+func TestSplitByIPFamily(t *testing.T) {
+	v4, v6 := splitByIPFamily([]string{"1.2.3.4", "2001:db8::1", "10.0.0.0/8", "fe80::/10", "::ffff:8.8.8.8"})
+	if !reflect.DeepEqual(v4, []string{"1.2.3.4", "10.0.0.0/8", "::ffff:8.8.8.8"}) {
+		t.Fatalf("v4 = %v", v4)
+	}
+	if !reflect.DeepEqual(v6, []string{"2001:db8::1", "fe80::/10"}) {
+		t.Fatalf("v6 = %v", v6)
+	}
+}
+
+func TestChunkStreamsSeparated(t *testing.T) {
+	st := testStore(t, "secret")
+	rec := doReq(st, "GET", "/lists/ipv4-1.txt", "", "")
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "1.2.0.0/16") || strings.Contains(rec.Body.String(), "2001:") {
+		t.Fatalf("ipv4 chunk: status=%d body=%q", rec.Code, rec.Body)
+	}
+	rec = doReq(st, "GET", "/lists/ipv6-1.txt", "", "")
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "2001:db8::1") || strings.Contains(rec.Body.String(), "9.9.9.9") {
+		t.Fatalf("ipv6 chunk: status=%d body=%q", rec.Code, rec.Body)
+	}
+	if rec := doReq(st, "GET", "/lists/ip-1.txt", "", ""); rec.Code != http.StatusNotFound {
+		t.Fatalf("legacy ip- URL should 404, got %d", rec.Code)
+	}
+	rec = doReq(st, "GET", "/", "", "")
+	body := rec.Body.String()
+	if !strings.Contains(body, "/lists/dns-") || !strings.Contains(body, "/lists/ipv4-") || !strings.Contains(body, "/lists/ipv6-") {
+		t.Fatalf("index missing family URLs: %s", body)
 	}
 }

@@ -7,7 +7,6 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"sort"
 	"sync"
 )
 
@@ -105,7 +104,7 @@ func (e *exclusionStore) list() (dns, ips []string) {
 	for k := range e.dns {
 		dns = append(dns, k)
 	}
-	sort.Strings(dns)
+	sortDomains(dns)
 	ips = make([]string, 0, len(e.ips))
 	for k := range e.ips {
 		ips = append(ips, k)
@@ -161,7 +160,7 @@ func (e *exclusionStore) saveLocked() error {
 	for k := range e.dns {
 		dns = append(dns, k)
 	}
-	sort.Strings(dns)
+	sortDomains(dns)
 	ips := make([]string, 0, len(e.ips))
 	for k := range e.ips {
 		ips = append(ips, k)

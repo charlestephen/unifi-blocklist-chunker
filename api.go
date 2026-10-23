@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"net/netip"
 	"slices"
-	"sort"
 	"strings"
 )
 
@@ -58,27 +57,17 @@ func (s *store) requireAdmin(w http.ResponseWriter, r *http.Request, basicChalle
 
 // --- search ---
 
-// ipSortKey mirrors the ordering applied by sortIPs.
-func ipSortKey(entry string) (netip.Addr, int) {
-	if p, err := netip.ParsePrefix(entry); err == nil {
-		return p.Addr(), p.Bits()
+func findIP(entries []string, target string) int {
+	i, found := slices.BinarySearchFunc(entries, target, ipCompare)
+	if found {
+		return i
 	}
-	if a, err := netip.ParseAddr(entry); err == nil {
-		return a, -1
-	}
-	return netip.Addr{}, -1
+	return -1
 }
 
-func findIP(entries []string, target string) int {
-	tAddr, tBits := ipSortKey(target)
-	i := sort.Search(len(entries), func(i int) bool {
-		a, b := ipSortKey(entries[i])
-		if c := a.Compare(tAddr); c != 0 {
-			return c > 0
-		}
-		return b >= tBits
-	})
-	if i < len(entries) && entries[i] == target {
+func findDomain(entries []string, target string) int {
+	i, found := slices.BinarySearchFunc(entries, target, domainCompare)
+	if found {
 		return i
 	}
 	return -1
@@ -86,23 +75,17 @@ func findIP(entries []string, target string) int {
 
 func findEntry(snap *snapshot, entry string, isIP bool) (inAll, inServed int) {
 	if isIP {
-		return findIP(snap.ipAll, entry), findIP(snap.ipServed, entry)
+		if isIPv4Entry(entry) {
+			return findIP(snap.ipv4All, entry), findIP(snap.ipv4Served, entry)
+		}
+		return findIP(snap.ipv6All, entry), findIP(snap.ipv6Served, entry)
 	}
-	ai, _ := slices.BinarySearch(snap.dnsAll, entry)
-	si, _ := slices.BinarySearch(snap.dnsServed, entry)
-	inAll, inServed = -1, -1
-	if ai < len(snap.dnsAll) && snap.dnsAll[ai] == entry {
-		inAll = ai
-	}
-	if si < len(snap.dnsServed) && snap.dnsServed[si] == entry {
-		inServed = si
-	}
-	return inAll, inServed
+	return findDomain(snap.dnsAll, entry), findDomain(snap.dnsServed, entry)
 }
 
 // coveredBy returns the served entry that covers the query without being
-// it: a parent domain for DNS names, or a containing CIDR for IPs. It is
-// informational only — exclusions remain exact-match. "" means none.
+// it: a parent domain for DNS names, or a containing CIDR for IPs of the
+// same family. Informational only — exclusions remain exact-match.
 func coveredBy(snap *snapshot, entry string, isIP bool) string {
 	if isIP {
 		var addr netip.Addr
@@ -114,7 +97,11 @@ func coveredBy(snap *snapshot, entry string, isIP bool) string {
 		} else {
 			return ""
 		}
-		for _, e := range snap.ipServed {
+		served := snap.ipv6Served
+		if isIPv4Entry(entry) {
+			served = snap.ipv4Served
+		}
+		for _, e := range served {
 			p, err := netip.ParsePrefix(e)
 			if err != nil || p.Bits() > bits {
 				continue
@@ -135,16 +122,27 @@ func coveredBy(snap *snapshot, entry string, isIP bool) string {
 		if !strings.Contains(rest, ".") {
 			return ""
 		}
-		if j, _ := slices.BinarySearch(snap.dnsServed, rest); j < len(snap.dnsServed) && snap.dnsServed[j] == rest {
+		if findDomain(snap.dnsServed, rest) >= 0 {
 			return rest
 		}
 	}
 }
 
+// entryType is the chunk-stream label for a normalized entry.
+func entryType(entry string, isIP bool) string {
+	if !isIP {
+		return "dns"
+	}
+	if isIPv4Entry(entry) {
+		return "ipv4"
+	}
+	return "ipv6"
+}
+
 type searchResult struct {
 	Query      string `json:"query"`
 	Normalized string `json:"normalized"`
-	Type       string `json:"type"` // "dns" or "ip"
+	Type       string `json:"type"` // "dns", "ipv4", or "ipv6"
 	Found      bool   `json:"found"`
 	InSnapshot bool   `json:"in_snapshot"`
 	Excluded   bool   `json:"excluded"`
@@ -158,10 +156,7 @@ func (s *store) search(snap *snapshot, base, raw string) (searchResult, bool) {
 	if !ok {
 		return searchResult{}, false
 	}
-	res := searchResult{Query: raw, Normalized: entry, Type: "dns"}
-	if isIP {
-		res.Type = "ip"
-	}
+	res := searchResult{Query: raw, Normalized: entry, Type: entryType(entry, isIP)}
 	res.Excluded = s.excl != nil && s.excl.contains(entry, isIP)
 	inAll, inServed := findEntry(snap, entry, isIP)
 	res.InSnapshot = inAll >= 0
@@ -260,11 +255,7 @@ func (s *store) handleAddExclusion(w http.ResponseWriter, r *http.Request) {
 	if changed {
 		status = http.StatusCreated
 	}
-	typ := "dns"
-	if isIP {
-		typ = "ip"
-	}
-	resp := map[string]any{"entry": entry, "type": typ, "excluded": true, "changed": changed}
+	resp := map[string]any{"entry": entry, "type": entryType(entry, isIP), "excluded": true, "changed": changed}
 	if snap := s.cur.Load(); snap != nil {
 		inAll, _ := findEntry(snap, entry, isIP)
 		resp["in_snapshot"] = inAll >= 0
@@ -295,11 +286,7 @@ func (s *store) handleRemoveExclusion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.rebuild()
-	typ := "dns"
-	if isIP {
-		typ = "ip"
-	}
-	resp := map[string]any{"entry": entry, "type": typ, "excluded": false, "restored": true}
+	resp := map[string]any{"entry": entry, "type": entryType(entry, isIP), "excluded": false, "restored": true}
 	if snap := s.cur.Load(); snap != nil {
 		inAll, inServed := findEntry(snap, entry, isIP)
 		resp["in_snapshot"] = inAll >= 0

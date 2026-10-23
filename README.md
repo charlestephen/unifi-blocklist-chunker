@@ -12,11 +12,16 @@ Controller (which rejects oversized external blocklists).
    **JSON** (array of strings, or any object containing string arrays),
    **YAML**, and **TOML**.
 2. Entries are normalized (lowercased, wildcards/schemes/hosts prefixes
-   stripped, CIDRs masked) and classified as DNS names or IPs/CIDRs.
+   stripped, CIDRs masked) and classified as **domains**, **IPv4**, or
+   **IPv6** (IPv4-mapped IPv6 addresses like `::ffff:a.b.c.d` count as IPv4).
 3. Entries are deduplicated **across all source lists** per class, sorted, and
-   split into chunks of at most `CHUNK_SIZE` entries. Chunk count is purely a
-   function of unique-entry count vs. chunk size — there are no fixed
-   endpoints.
+   split into separate domain / IPv4 / IPv6 chunk streams of at most
+   `CHUNK_SIZE` entries each. Domains sort by label from the TLD leftward
+   (`cloudflare.com` before `google.com` before `mail.google.com`; `.com`
+   before `.nyc`). IPv4 and IPv6 sort numerically (128-bit for IPv6, so
+   `2006::1` before `2006:0:1::1` before `2006:1::1`; compressed forms like
+   `2006:0::1` normalize to `2006::1`). Chunk count is purely a function of
+   unique-entry count vs. chunk size — there are no fixed endpoints.
 4. A failed source never takes the service down: other sources still apply,
    and a refresh yielding zero entries keeps the previous snapshot.
 
@@ -25,8 +30,9 @@ Controller (which rejects oversized external blocklists).
 | Endpoint | Description |
 | --- | --- |
 | `GET /` | Plain-text index of all chunk URLs (generated from the request's public origin) |
-| `GET /lists/dns-<n>.txt` | DNS chunk `n` (1-based), one entry per line |
-| `GET /lists/ip-<n>.txt` | IP/CIDR chunk `n` (1-based), one entry per line |
+| `GET /lists/dns-<n>.txt` | Domain chunk `n` (1-based), one entry per line |
+| `GET /lists/ipv4-<n>.txt` | IPv4/CIDR chunk `n` (1-based), one entry per line |
+| `GET /lists/ipv6-<n>.txt` | IPv6/CIDR chunk `n` (1-based), one entry per line |
 | `GET /stats` | JSON: entry/chunk counts, source health, chunk URLs, exclusion counts |
 | `GET /healthz` | `ok` once any snapshot is loaded, else 503 |
 | `POST /refresh` | Trigger an immediate re-fetch |
